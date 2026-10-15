@@ -51,7 +51,7 @@ func AccessLog(logger *slog.Logger, quiet func(*http.Request) bool) func(http.Ha
 				slog.String("route", RouteTemplate(r)),
 				slog.Int("status", statusOf(ww)),
 				slog.Int("bytes", ww.BytesWritten()),
-				slog.Duration("duration", time.Since(start)),
+				slog.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000),
 			)
 		})
 	}

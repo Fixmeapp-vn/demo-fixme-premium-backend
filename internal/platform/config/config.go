@@ -106,11 +106,11 @@ func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("app_env", string(c.AppEnv)),
 		slog.String("http_addr", c.HTTP.Addr),
-		slog.Duration("http_read_timeout", c.HTTP.ReadTimeout),
-		slog.Duration("http_read_header_timeout", c.HTTP.ReadHeaderTimeout),
-		slog.Duration("http_write_timeout", c.HTTP.WriteTimeout),
-		slog.Duration("http_idle_timeout", c.HTTP.IdleTimeout),
-		slog.Duration("shutdown_timeout", c.ShutdownTimeout),
+		slog.String("http_read_timeout", c.HTTP.ReadTimeout.String()),
+		slog.String("http_read_header_timeout", c.HTTP.ReadHeaderTimeout.String()),
+		slog.String("http_write_timeout", c.HTTP.WriteTimeout.String()),
+		slog.String("http_idle_timeout", c.HTTP.IdleTimeout.String()),
+		slog.String("shutdown_timeout", c.ShutdownTimeout.String()),
 		slog.String("metrics_addr", c.MetricsAddr),
 		slog.String("log_level", c.LogLevel.String()),
 	)

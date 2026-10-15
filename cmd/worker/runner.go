@@ -61,13 +61,13 @@ func (r *Runner) Run(ctx context.Context) error {
 	// shutdown rather than terminating the process.
 	<-jobCtx.Done()
 
-	r.logger.Info("worker shutdown started", slog.Duration("timeout", r.shutdownTimeout))
+	r.logger.Info("worker shutdown started", slog.String("timeout", r.shutdownTimeout.String()))
 	timer := time.NewTimer(r.shutdownTimeout)
 	defer timer.Stop()
 	select {
 	case <-done:
 	case <-timer.C:
-		r.logger.Error("worker shutdown deadline exceeded", slog.Duration("timeout", r.shutdownTimeout))
+		r.logger.Error("worker shutdown deadline exceeded", slog.String("timeout", r.shutdownTimeout.String()))
 		return fmt.Errorf("worker: jobs did not stop within %s", r.shutdownTimeout)
 	}
 

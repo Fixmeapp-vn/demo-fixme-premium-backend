@@ -80,13 +80,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	case <-ctx.Done():
 	}
 
-	s.logger.Info("server shutdown started", slog.Duration("timeout", s.cfg.ShutdownTimeout))
+	s.logger.Info("server shutdown started", slog.String("timeout", s.cfg.ShutdownTimeout.String()))
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer cancel()
 
 	if err := s.srv.Shutdown(shutdownCtx); err != nil {
 		s.logger.Error("server shutdown deadline exceeded; cancelling in-flight requests",
-			slog.Duration("timeout", s.cfg.ShutdownTimeout), slog.Any("error", err))
+			slog.String("timeout", s.cfg.ShutdownTimeout.String()), slog.Any("error", err))
 		cancelRequests()
 		_ = s.srv.Close()
 		<-serveErr

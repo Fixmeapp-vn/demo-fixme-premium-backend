@@ -342,7 +342,7 @@ func TestAccessLogUsesRouteTemplate(t *testing.T) {
 			t.Errorf("access log %s = %v, want %v", k, l[k], v)
 		}
 	}
-	if _, ok := l["duration"]; !ok {
+	if _, ok := l["duration_ms"]; !ok {
 		t.Error("access log has no duration")
 	}
 	if strings.Contains(h.logs.String(), "secret-token-123") || strings.Contains(h.logs.String(), "a@b.c") {
