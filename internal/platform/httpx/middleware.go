@@ -11,8 +11,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-// UnmatchedRoute is the route label used for requests that matched no route,
-// so raw request paths never reach logs or metric labels.
+// UnmatchedRoute is the route label used for requests that matched no route
+// (404s and 405s), so raw request paths never reach logs or metric labels.
 const UnmatchedRoute = "unmatched"
 
 // RouteTemplate returns the matched chi route pattern (e.g. "/api/v1/users/{id}"),
