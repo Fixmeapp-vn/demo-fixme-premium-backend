@@ -13,8 +13,10 @@ modules build on top of it in later stories.
 - Go **1.22** (pinned in `go.mod`; `go version` must report 1.22 or newer)
 - `make`
 - A C toolchain (e.g. `gcc`) only for `make test-race`
+- PostgreSQL **16** only for the User module database (see
+  [Database & migrations](#database--migrations)); the api starts without it.
 
-PostgreSQL and Docker are **not** required yet.
+Docker is **not** required yet (the dev suite is FMT-18).
 
 ## Quick start
 
@@ -67,6 +69,7 @@ SHUTDOWN_TIMEOUT: 1h0m0s is out of range: must be between 100ms and 10m0s
 | ----------------- | -------------------------------------- |
 | `make run-api`    | Run the API locally                    |
 | `make run-worker` | Run the background worker locally      |
+| `make migrate`    | Apply User module DB migrations        |
 | `make build`      | Build `bin/api` and `bin/worker`       |
 | `make test`       | Run unit tests                         |
 | `make test-race`  | Run unit tests with the race detector  |
@@ -79,16 +82,20 @@ SHUTDOWN_TIMEOUT: 1h0m0s is out of range: must be between 100ms and 10m0s
 cmd/
   api/              API entry point: config, logger, API + metrics listeners
   worker/           Worker entry point and job runner
-  migrate/          reserved (BE-002)
+  migrate/          forward-only DB migration entry point (user_migrate role)
 internal/
   platform/         shared technical packages; never import business modules
     config/         typed env configuration and validation
     logging/        slog JSON logger, request ID context propagation
-    httpx/          router, middleware, Problem Details, server lifecycle
+    httpx/          router, middleware, Problem Details, server lifecycle, readiness
     observability/  Prometheus registry, HTTP and runtime metrics
-  user/             reserved (BE-004+)
+    postgres/       lazy pgx pool and readiness check
+  user/             User module
+    migrations/     embedded forward-only SQL migrations (user_db)
+    dbtest/         gated Postgres integration tests
 contracts/openapi/  reserved for API contracts
-deployments/        reserved (BE-012)
+deployments/
+  postgres/         user_db bootstrap and least-privilege model
 ```
 
 Entry points stay thin: `main` only wires signals and calls `run`, which
@@ -101,7 +108,12 @@ returns an exit code and is covered by tests.
 - Chi router. Business modules implement `httpx.Module` and are mounted
   under `/api/v1` via `httpx.NewRouter(deps, modules...)`.
 - `GET /health/live` returns `200 {"status":"ok"}` and has no external
-  dependencies.
+  dependencies (it never touches the database).
+- `GET /health/ready` returns `200 {"status":"ok"}` only once every registered
+  dependency check passes; otherwise `503` with `Cache-Control: no-store` and a
+  per-check body (e.g. `{"status":"unavailable","checks":{"user_db":"..."}}`).
+  With no checks registered it returns `200`. See
+  [Database & migrations](#database--migrations).
 - Errors use [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) Problem
   Details with `Content-Type: application/problem+json` and a stable `code`:
 
@@ -173,11 +185,73 @@ disconnects.
 `Job`s (`Name()`, `Run(ctx)`) until shut down. Each job gets up to
 `SHUTDOWN_TIMEOUT` to return after cancellation. No jobs are registered yet.
 
+## Database & migrations
+
+The **User module** owns a dedicated database, `user_db` — not a shared
+database and not a schema inside another database. It has its own credentials
+and its own migrations under `internal/user/migrations`. The authoritative
+description of the privilege model lives in
+[`deployments/postgres/`](deployments/postgres/).
+
+### Two roles, least privilege
+
+| Role           | Capabilities                                   | Used by            |
+| -------------- | ---------------------------------------------- | ------------------ |
+| `user_migrate` | Owns `user_db` and its objects; full DDL       | `cmd/migrate` only |
+| `user_runtime` | DML only (`SELECT/INSERT/UPDATE/DELETE`), sequence usage; no DDL, no ownership | `api`, `worker` |
+
+`CONNECT` on `user_db` is granted only to those two roles; PUBLIC `CONNECT`
+and `CREATE` are revoked. Objects created by **future** migrations (run as
+`user_migrate`) automatically grant DML and sequence access to `user_runtime`
+via `ALTER DEFAULT PRIVILEGES`, so a new table needs no explicit grant in its
+migration. The provisioning script is
+[`deployments/postgres/initdb/00-init-user-db.sh`](deployments/postgres/initdb/00-init-user-db.sh).
+
+### Connection strings
+
+| Variable                    | Role           | Read by         | Purpose          |
+| --------------------------- | -------------- | --------------- | ---------------- |
+| `USER_DATABASE_URL`         | `user_runtime` | `api`, `worker` | Runtime DML      |
+| `USER_MIGRATE_DATABASE_URL` | `user_migrate` | `cmd/migrate`   | Forward-only DDL |
+
+Both carry a password and are **never logged**: `USER_DATABASE_URL` is excluded
+from `Config.LogValue`, and `USER_MIGRATE_DATABASE_URL` is read directly by
+`cmd/migrate` and is deliberately absent from the shared `config` package.
+`USER_DATABASE_URL` is optional; when it is unset the api starts with no
+database readiness check.
+
+### Running migrations
+
+Migrations are forward-only, versioned, embedded in the binary, and applied
+**only** by `cmd/migrate` — never auto-applied by the api or worker at runtime.
+
+```sh
+export USER_MIGRATE_DATABASE_URL=postgres://user_migrate:...@localhost:5432/user_db
+make migrate                 # or: go run ./cmd/migrate up
+go run ./cmd/migrate version # print the current schema version
+```
+
+There is no `down` command: reversing a migration is a deliberate future
+decision.
+
+### Readiness vs liveness
+
+- `GET /health/live` never touches Postgres, so it stays up even when the
+  database is down.
+- `GET /health/ready` reports healthy only once `user_runtime` can connect to
+  `user_db`. The runtime pool is lazy, so the api starts while Postgres is down
+  and readiness flips to `200` once it becomes reachable.
+
+### Scope
+
+FMT-8 covers the Postgres instance, the migrate step and the two-role boundary
+only. The Docker Compose / hot-reload dev suite is **FMT-18**, and the
+cross-module CI import check is **FMT-17** — both out of scope here.
+
 ## Not yet implemented
 
 | Capability                                      | Story   |
 | ----------------------------------------------- | ------- |
-| PostgreSQL, migrations (`cmd/migrate`), readiness checks | BE-002  |
 | Authentication and authorization middleware     | BE-003  |
 | User module (`internal/user`)                   | BE-004+ |
 | Event processing and outbox                     | BE-010  |

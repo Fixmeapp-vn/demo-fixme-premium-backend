@@ -3,7 +3,9 @@ package httpx_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -60,6 +62,36 @@ func newHarness(t *testing.T, modules ...httpx.Module) *harness {
 		logs:    logs,
 		obs:     obs,
 	}
+}
+
+func newReadinessHarness(t *testing.T, timeout time.Duration, checks ...httpx.HealthCheck) *harness {
+	t.Helper()
+	logs := &bytes.Buffer{}
+	obs := &fakeObserver{}
+	logger := logging.New(logs, logging.Options{Service: "api", Env: "test", Level: slog.LevelDebug})
+	return &harness{
+		handler: httpx.NewRouter(httpx.RouterDeps{
+			Logger:           logger,
+			Observer:         obs,
+			ReadinessChecks:  checks,
+			ReadinessTimeout: timeout,
+		}),
+		logs: logs,
+		obs:  obs,
+	}
+}
+
+type fakeCheck struct {
+	name   string
+	err    error
+	called bool
+}
+
+func (f *fakeCheck) Name() string { return f.name }
+
+func (f *fakeCheck) Check(context.Context) error {
+	f.called = true
+	return f.err
 }
 
 func (h *harness) do(method, target string, header http.Header) *httptest.ResponseRecorder {
@@ -129,6 +161,73 @@ func TestLiveness(t *testing.T) {
 	}
 	if body := strings.TrimSpace(rec.Body.String()); body != `{"status":"ok"}` {
 		t.Errorf("body = %s", body)
+	}
+}
+
+func TestReadinessWithoutChecksIsOK(t *testing.T) {
+	h := newReadinessHarness(t, 0)
+	rec := h.do(http.MethodGet, "/health/ready", nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", cc)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"status":"ok"}` {
+		t.Errorf("body = %s", body)
+	}
+}
+
+func TestReadinessPassingCheck(t *testing.T) {
+	check := &fakeCheck{name: "user_db"}
+	h := newReadinessHarness(t, 0, check)
+	rec := h.do(http.MethodGet, "/health/ready", nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !check.called {
+		t.Error("readiness did not invoke the registered check")
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"status":"ok","checks":{"user_db":"ok"}}` {
+		t.Errorf("body = %s", body)
+	}
+}
+
+func TestReadinessFailingCheck(t *testing.T) {
+	check := &fakeCheck{name: "user_db", err: errors.New("dial tcp 10.0.0.1:5432: connection refused")}
+	h := newReadinessHarness(t, 0, check)
+	rec := h.do(http.MethodGet, "/health/ready", nil)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", cc)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"status":"unavailable","checks":{"user_db":"unavailable"}}` {
+		t.Errorf("body = %s", body)
+	}
+	// The underlying error must never reach the client.
+	if strings.Contains(rec.Body.String(), "connection refused") || strings.Contains(rec.Body.String(), "10.0.0.1") {
+		t.Errorf("readiness body leaks check error: %s", rec.Body.String())
+	}
+}
+
+func TestLivenessNeverInvokesChecks(t *testing.T) {
+	check := &fakeCheck{name: "user_db", err: errors.New("down")}
+	h := newReadinessHarness(t, 0, check)
+
+	rec := h.do(http.MethodGet, "/health/live", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("liveness status = %d, want 200", rec.Code)
+	}
+	if check.called {
+		t.Error("liveness invoked a readiness check; it must stay dependency-free")
 	}
 }
 
