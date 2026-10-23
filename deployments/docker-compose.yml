@@ -1,0 +1,43 @@
+# FMT-8 / BE-002: minimal Postgres + migrate step only.
+#
+# This is deliberately NOT the full dev/hot-reload suite (api, worker, live
+# reload) — that is FMT-18. The goal here is just to prove the two-role
+# isolation boundary: bring up Postgres, let it provision user_db plus the
+# user_migrate / user_runtime roles, then run the forward-only migrations as
+# the migrate role.
+#
+# Usage: docker compose -f deployments/docker-compose.yml up
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      # Consumed by the initdb bootstrap script to set the role passwords.
+      USER_MIGRATE_PASSWORD: migrate
+      USER_RUNTIME_PASSWORD: runtime
+    volumes:
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # One-shot job: runs the User module's forward-only migrations as the
+  # user_migrate role, then exits.
+  migrate:
+    image: golang:1.22
+    working_dir: /src
+    # Read-write mount so the Go build cache can be written during `go run`.
+    volumes:
+      - ..:/src
+    environment:
+      USER_MIGRATE_DATABASE_URL: postgres://user_migrate:migrate@postgres:5432/user_db?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["go", "run", "./cmd/migrate", "up"]

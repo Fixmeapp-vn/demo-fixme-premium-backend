@@ -49,6 +49,11 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	MetricsAddr     string
 	LogLevel        slog.Level
+	// UserDatabaseURL is the runtime DSN for the User module (the user_runtime
+	// role, DML only), read from USER_DATABASE_URL. It is optional; when empty
+	// the API still starts but readiness reports not-ready. It is a secret and
+	// is deliberately excluded from LogValue.
+	UserDatabaseURL string
 }
 
 // HTTP holds the public HTTP server settings.
@@ -85,6 +90,7 @@ func Load(lookup LookupFunc) (Config, error) {
 		ShutdownTimeout: l.duration("SHUTDOWN_TIMEOUT", DefaultShutdownTimeout),
 		MetricsAddr:     l.addr("METRICS_ADDR", DefaultMetricsAddr),
 		LogLevel:        l.logLevel("LOG_LEVEL", DefaultLogLevel),
+		UserDatabaseURL: l.databaseURL("USER_DATABASE_URL"),
 	}
 
 	if cfg.HTTP.ReadHeaderTimeout > cfg.HTTP.ReadTimeout && cfg.HTTP.ReadTimeout > 0 {
@@ -178,6 +184,20 @@ func (l *loader) duration(key string, def time.Duration) time.Duration {
 		return 0
 	}
 	return d
+}
+
+// databaseURL reads an optional Postgres DSN. It returns "" when unset or
+// empty, and otherwise lightly validates the scheme. The value is never logged.
+func (l *loader) databaseURL(key string) string {
+	v, ok := l.raw(key)
+	if !ok || v == "" {
+		return ""
+	}
+	if !strings.HasPrefix(v, "postgres://") && !strings.HasPrefix(v, "postgresql://") {
+		l.fail(key, "invalid value: must be a postgres:// or postgresql:// URL")
+		return ""
+	}
+	return v
 }
 
 func (l *loader) logLevel(key string, def slog.Level) slog.Level {
