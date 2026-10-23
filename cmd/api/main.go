@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/config"
+	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/database"
 	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/httpx"
 	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/logging"
 	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/observability"
@@ -44,6 +45,23 @@ func run(ctx context.Context, lookup config.LookupFunc, stdout, stderr io.Writer
 
 	metrics := observability.NewMetrics()
 
+	// Readiness depends on the User module database. When its runtime DSN is
+	// not configured, readiness reports not-ready rather than silently passing;
+	// liveness stays independent of the database either way.
+	var userDBCheck httpx.ReadinessChecker
+	if cfg.UserDatabaseURL == "" {
+		logger.Warn("USER_DATABASE_URL is not set; /health/ready will report not-ready")
+		userDBCheck = database.NewUnavailableChecker("user_db", "USER_DATABASE_URL not configured")
+	} else {
+		pool, err := database.NewPool(ctx, cfg.UserDatabaseURL)
+		if err != nil {
+			logger.Error("could not create user database pool", slog.Any("error", err))
+			return 1
+		}
+		defer pool.Close()
+		userDBCheck = database.NewPingChecker("user_db", pool)
+	}
+
 	api := httpx.NewServer(httpx.ServerConfig{
 		Name:              "api",
 		Addr:              cfg.HTTP.Addr,
@@ -52,7 +70,11 @@ func run(ctx context.Context, lookup config.LookupFunc, stdout, stderr io.Writer
 		WriteTimeout:      cfg.HTTP.WriteTimeout,
 		IdleTimeout:       cfg.HTTP.IdleTimeout,
 		ShutdownTimeout:   cfg.ShutdownTimeout,
-	}, httpx.NewRouter(httpx.RouterDeps{Logger: logger, Observer: metrics}), logger)
+	}, httpx.NewRouter(httpx.RouterDeps{
+		Logger:    logger,
+		Observer:  metrics,
+		Readiness: []httpx.ReadinessChecker{userDBCheck},
+	}), logger)
 
 	internal := httpx.NewServer(httpx.ServerConfig{
 		Name:              "metrics",

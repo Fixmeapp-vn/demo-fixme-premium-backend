@@ -1,10 +1,12 @@
 package httpx
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -14,6 +16,18 @@ const APIPrefix = "/api/v1"
 
 // LivenessPath is the liveness probe endpoint.
 const LivenessPath = "/health/live"
+
+// ReadinessPath is the readiness probe endpoint.
+const ReadinessPath = "/health/ready"
+
+// DefaultReadinessTimeout bounds how long readiness checks may run in total.
+const DefaultReadinessTimeout = 2 * time.Second
+
+// ReadinessChecker reports whether a backing dependency is ready to serve.
+type ReadinessChecker interface {
+	Name() string
+	Check(ctx context.Context) error
+}
 
 // Module is implemented by business modules that expose HTTP routes. The
 // router passed to RegisterRoutes is already scoped to APIPrefix.
@@ -30,6 +44,12 @@ func (f ModuleFunc) RegisterRoutes(r chi.Router) { f(r) }
 type RouterDeps struct {
 	Logger   *slog.Logger
 	Observer RequestObserver
+	// Readiness are the dependency checks reported by ReadinessPath. When
+	// empty, readiness reports ready.
+	Readiness []ReadinessChecker
+	// ReadinessTimeout bounds every readiness probe. Zero uses
+	// DefaultReadinessTimeout.
+	ReadinessTimeout time.Duration
 }
 
 // NewRouter builds the public API router.
@@ -52,6 +72,12 @@ func NewRouter(deps RouterDeps, modules ...Module) http.Handler {
 
 	r.Get(LivenessPath, liveness)
 
+	timeout := deps.ReadinessTimeout
+	if timeout <= 0 {
+		timeout = DefaultReadinessTimeout
+	}
+	r.Get(ReadinessPath, readiness(deps.Readiness, timeout, deps.Logger))
+
 	r.Route(APIPrefix, func(api chi.Router) {
 		for _, m := range modules {
 			m.RegisterRoutes(api)
@@ -69,6 +95,46 @@ func liveness(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// readiness reports whether every dependency check passes. Unlike liveness, it
+// has dependencies: a failing check yields 503 so load balancers stop routing
+// traffic while the process itself stays alive.
+func readiness(checks []ReadinessChecker, timeout time.Duration, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+
+		ready := true
+		results := make(map[string]string, len(checks))
+		for _, c := range checks {
+			if err := c.Check(ctx); err != nil {
+				ready = false
+				results[c.Name()] = "unavailable"
+				if logger != nil {
+					logger.LogAttrs(ctx, slog.LevelWarn, "readiness check failed",
+						slog.String("check", c.Name()), slog.Any("error", err))
+				}
+				continue
+			}
+			results[c.Name()] = "ok"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+
+		if ready {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		}
+
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "unavailable",
+			"checks": results,
+		})
+	}
 }
 
 var allowCandidates = []string{

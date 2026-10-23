@@ -13,8 +13,8 @@ modules build on top of it in later stories.
 - Go **1.22** (pinned in `go.mod`; `go version` must report 1.22 or newer)
 - `make`
 - A C toolchain (e.g. `gcc`) only for `make test-race`
-
-PostgreSQL and Docker are **not** required yet.
+- PostgreSQL and Docker only for the database features (migrations, readiness,
+  `make migrate`, integration tests). The api and worker run without them.
 
 ## Quick start
 
@@ -67,9 +67,12 @@ SHUTDOWN_TIMEOUT: 1h0m0s is out of range: must be between 100ms and 10m0s
 | ----------------- | -------------------------------------- |
 | `make run-api`    | Run the API locally                    |
 | `make run-worker` | Run the background worker locally      |
-| `make build`      | Build `bin/api` and `bin/worker`       |
+| `make build`      | Build `bin/api`, `bin/worker`, `bin/migrate` |
+| `make migrate`    | Apply forward-only migrations          |
+| `make migrate-version` | Print the current migration version |
 | `make test`       | Run unit tests                         |
 | `make test-race`  | Run unit tests with the race detector  |
+| `make test-integration` | Run DB integration tests (needs Postgres) |
 | `make fmt`        | Format Go code                         |
 | `make vet`        | Run `go vet`                           |
 
@@ -79,16 +82,20 @@ SHUTDOWN_TIMEOUT: 1h0m0s is out of range: must be between 100ms and 10m0s
 cmd/
   api/              API entry point: config, logger, API + metrics listeners
   worker/           Worker entry point and job runner
-  migrate/          reserved (BE-002)
+  migrate/          forward-only migration runner (user_migrate role)
 internal/
   platform/         shared technical packages; never import business modules
     config/         typed env configuration and validation
+    database/       Postgres pool + readiness checks (no module imports)
     logging/        slog JSON logger, request ID context propagation
     httpx/          router, middleware, Problem Details, server lifecycle
     observability/  Prometheus registry, HTTP and runtime metrics
-  user/             reserved (BE-004+)
+  user/
+    db/             embedded SQL migrations and the migrate runner
 contracts/openapi/  reserved for API contracts
-deployments/        reserved (BE-012)
+deployments/
+  postgres/initdb/  superuser bootstrap: user_db + the two roles
+  docker-compose.yml  minimal Postgres + migrate step (FMT-8)
 ```
 
 Entry points stay thin: `main` only wires signals and calls `run`, which
@@ -102,6 +109,9 @@ returns an exit code and is covered by tests.
   under `/api/v1` via `httpx.NewRouter(deps, modules...)`.
 - `GET /health/live` returns `200 {"status":"ok"}` and has no external
   dependencies.
+- `GET /health/ready` runs the configured dependency checks: `200
+  {"status":"ok"}` when all pass, `503 {"status":"unavailable","checks":{...}}`
+  otherwise. It depends on the User module database; liveness does not.
 - Errors use [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) Problem
   Details with `Content-Type: application/problem+json` and a stable `code`:
 
@@ -173,13 +183,70 @@ disconnects.
 `Job`s (`Name()`, `Run(ctx)`) until shut down. Each job gets up to
 `SHUTDOWN_TIMEOUT` to return after cancellation. No jobs are registered yet.
 
+### Database (User module isolation)
+
+The User module owns an isolated database, `user_db`, reached through two
+least-privilege roles:
+
+| Role           | Rights                                                   | Used by        |
+| -------------- | -------------------------------------------------------- | -------------- |
+| `user_migrate` | owns the `public` schema; DDL (runs migrations)          | `cmd/migrate`  |
+| `user_runtime` | `USAGE` on the schema plus DML on tables and sequences   | api / worker   |
+
+`user_runtime` is granted no `CREATE`; `CONNECT` on `user_db` is revoked from
+`PUBLIC` and granted only to these two roles. `ALTER DEFAULT PRIVILEGES`
+(configured once at bootstrap) means tables and sequences created by *future*
+migrations automatically grant DML to `user_runtime`, so migrations never carry
+explicit `GRANT`s. The superuser bootstrap lives in
+[`deployments/postgres/initdb`](deployments/postgres/initdb).
+
+Two DSNs carry the boundary, and neither is ever logged:
+
+| Variable                    | Role           | Read by       |
+| --------------------------- | -------------- | ------------- |
+| `USER_DATABASE_URL`         | `user_runtime` | api / worker  |
+| `USER_MIGRATE_DATABASE_URL` | `user_migrate` | `cmd/migrate` only |
+
+`USER_DATABASE_URL` flows through the shared config and is optional: when unset,
+the api still starts and `/health/live` stays healthy, but `/health/ready`
+reports not-ready. `USER_MIGRATE_DATABASE_URL` is read directly by `cmd/migrate`
+and never passes through the shared config, so the api and worker cannot read
+it.
+
+Migrations are **forward-only** (no `.down.sql` files), embedded into the
+`migrate` binary from `internal/user/db/migrations`.
+
+Bring up Postgres and apply migrations:
+
+```sh
+# Minimal Postgres + one-shot migrate step (proves the two-role boundary).
+docker compose -f deployments/docker-compose.yml up
+
+# Or, against an already-running Postgres:
+export USER_MIGRATE_DATABASE_URL=postgres://user_migrate:...@localhost:5432/user_db?sslmode=disable
+make migrate          # apply forward-only migrations
+make migrate-version  # print current version
+```
+
+Integration tests that exercise the real two-role boundary are tag-gated
+(`//go:build integration`) and run only when `FMT8_TEST_ADMIN_URL` (a superuser
+DSN, dbname `postgres`) is set:
+
+```sh
+FMT8_TEST_ADMIN_URL=postgres://postgres:postgres@localhost:5432/postgres \
+  make test-integration
+```
+
 ## Not yet implemented
 
 | Capability                                      | Story   |
 | ----------------------------------------------- | ------- |
-| PostgreSQL, migrations (`cmd/migrate`), readiness checks | BE-002  |
 | Authentication and authorization middleware     | BE-003  |
-| User module (`internal/user`)                   | BE-004+ |
+| User module HTTP/domain logic (`internal/user`) | BE-004+ |
 | Event processing and outbox                     | BE-010  |
-| CI pipelines and architecture linting           | BE-011  |
-| Dockerfile, Docker Compose, onboarding environment | BE-012  |
+| CI pipelines and architecture import linting    | FMT-17  |
+| Full dev / hot-reload Docker Compose suite       | FMT-18  |
+
+The minimal Postgres + migrate Compose step shipped with FMT-8 proves the
+two-role isolation boundary only; the full dev/hot-reload suite is FMT-18, and
+the CI import check that enforces the platform/module boundary is FMT-17.

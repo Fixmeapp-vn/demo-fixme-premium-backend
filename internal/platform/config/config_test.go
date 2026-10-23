@@ -153,3 +153,54 @@ func TestConfigLogValue(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadUserDatabaseURLUnset(t *testing.T) {
+	cfg, err := config.Load(lookupFrom(nil))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.UserDatabaseURL != "" {
+		t.Errorf("UserDatabaseURL = %q, want empty", cfg.UserDatabaseURL)
+	}
+}
+
+func TestLoadUserDatabaseURLValid(t *testing.T) {
+	for _, dsn := range []string{
+		"postgres://user_runtime:secret@localhost:5432/user_db?sslmode=disable",
+		"postgresql://user_runtime:secret@localhost:5432/user_db",
+	} {
+		cfg, err := config.Load(lookupFrom(map[string]string{"USER_DATABASE_URL": dsn}))
+		if err != nil {
+			t.Fatalf("Load(%q) error = %v", dsn, err)
+		}
+		if cfg.UserDatabaseURL != dsn {
+			t.Errorf("UserDatabaseURL = %q, want %q", cfg.UserDatabaseURL, dsn)
+		}
+	}
+}
+
+func TestLoadUserDatabaseURLInvalidScheme(t *testing.T) {
+	_, err := config.Load(lookupFrom(map[string]string{"USER_DATABASE_URL": "mysql://x"}))
+	if err == nil {
+		t.Fatal("Load() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "USER_DATABASE_URL") {
+		t.Errorf("error %q does not mention USER_DATABASE_URL", err)
+	}
+}
+
+func TestConfigLogValueExcludesDatabaseURL(t *testing.T) {
+	const dsn = "postgres://user_runtime:topsecret@localhost:5432/user_db"
+	cfg, err := config.Load(lookupFrom(map[string]string{"USER_DATABASE_URL": dsn}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", slog.Any("config", cfg))
+
+	for _, leaked := range []string{dsn, "topsecret", "user_database_url", "UserDatabaseURL"} {
+		if strings.Contains(buf.String(), leaked) {
+			t.Errorf("log output leaks %q:\n%s", leaked, buf.String())
+		}
+	}
+}
