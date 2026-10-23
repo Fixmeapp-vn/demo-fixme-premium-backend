@@ -49,6 +49,12 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	MetricsAddr     string
 	LogLevel        slog.Level
+	// UserDatabaseURL is the runtime (DML-only) connection string for the
+	// User module database. Optional; empty when the API runs without a
+	// database. It carries a password and is deliberately absent from
+	// LogValue so it is never logged. The migrate role URL is NOT held here:
+	// it is read directly by cmd/migrate.
+	UserDatabaseURL string
 }
 
 // HTTP holds the public HTTP server settings.
@@ -85,6 +91,7 @@ func Load(lookup LookupFunc) (Config, error) {
 		ShutdownTimeout: l.duration("SHUTDOWN_TIMEOUT", DefaultShutdownTimeout),
 		MetricsAddr:     l.addr("METRICS_ADDR", DefaultMetricsAddr),
 		LogLevel:        l.logLevel("LOG_LEVEL", DefaultLogLevel),
+		UserDatabaseURL: l.databaseURL("USER_DATABASE_URL"),
 	}
 
 	if cfg.HTTP.ReadHeaderTimeout > cfg.HTTP.ReadTimeout && cfg.HTTP.ReadTimeout > 0 {
@@ -178,6 +185,22 @@ func (l *loader) duration(key string, def time.Duration) time.Duration {
 		return 0
 	}
 	return d
+}
+
+// databaseURL loads an optional Postgres connection string. An unset or empty
+// value yields "" (the service then runs without that database). A value that
+// is present must use a postgres:// or postgresql:// scheme. The value is
+// never echoed in error messages, as it carries a password.
+func (l *loader) databaseURL(key string) string {
+	v, ok := l.raw(key)
+	if !ok || v == "" {
+		return ""
+	}
+	if !strings.HasPrefix(v, "postgres://") && !strings.HasPrefix(v, "postgresql://") {
+		l.fail(key, "must be a postgres:// or postgresql:// connection URL")
+		return ""
+	}
+	return v
 }
 
 func (l *loader) logLevel(key string, def slog.Level) slog.Level {

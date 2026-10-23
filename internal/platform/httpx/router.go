@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -30,6 +31,13 @@ func (f ModuleFunc) RegisterRoutes(r chi.Router) { f(r) }
 type RouterDeps struct {
 	Logger   *slog.Logger
 	Observer RequestObserver
+
+	// ReadinessChecks are the dependency checks run by GET /health/ready.
+	// When empty, readiness always reports ready.
+	ReadinessChecks []HealthCheck
+	// ReadinessTimeout bounds all readiness checks together. Zero selects
+	// DefaultReadinessTimeout.
+	ReadinessTimeout time.Duration
 }
 
 // NewRouter builds the public API router.
@@ -51,6 +59,7 @@ func NewRouter(deps RouterDeps, modules ...Module) http.Handler {
 	r.MethodNotAllowed(methodNotAllowedHandler)
 
 	r.Get(LivenessPath, liveness)
+	r.Get(ReadinessPath, readiness(deps.ReadinessChecks, deps.ReadinessTimeout))
 
 	r.Route(APIPrefix, func(api chi.Router) {
 		for _, m := range modules {
