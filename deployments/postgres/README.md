@@ -27,15 +27,32 @@ official `postgres` image (mount it into `/docker-entrypoint-initdb.d/`). It:
 1. Creates the two `LOGIN` roles, reading passwords from `USER_MIGRATE_PASSWORD`
    and `USER_RUNTIME_PASSWORD` (no secrets are hardcoded).
 2. `CREATE DATABASE user_db OWNER user_migrate`.
-3. Inside `user_db`:
-   - `REVOKE ALL ON DATABASE user_db FROM PUBLIC` and grants `CONNECT` only to
-     `user_migrate` and `user_runtime`.
-   - `REVOKE ALL ON SCHEMA public FROM PUBLIC`; grants `USAGE, CREATE` to
-     `user_migrate` and `USAGE` only to `user_runtime`.
-   - `ALTER DEFAULT PRIVILEGES FOR ROLE user_migrate` so objects created by
-     **future** migrations automatically grant DML (`SELECT/INSERT/UPDATE/
-     DELETE` on tables) and sequence access (`USAGE, SELECT` on sequences) to
-     `user_runtime` — with nothing granted to `PUBLIC`.
+3. Inside `user_db`, applies the canonical privilege model from
+   `initdb/sql/user-db-privileges.sql` (see below).
+
+The in-database privilege model is **not** inlined in the script. It lives in
+one canonical file, `initdb/sql/user-db-privileges.sql`, which the script
+applies (substituting the concrete database, role and schema names) and which
+the integration test (`internal/user/dbtest`) executes against its throwaway
+database. Driving the same file from both keeps the model from drifting: a
+broken policy fails the tests instead of silently diverging. That file:
+
+- `REVOKE ALL ON DATABASE user_db FROM PUBLIC` and grants `CONNECT` only to
+  `user_migrate` and `user_runtime`.
+- `REVOKE ALL ON SCHEMA public FROM PUBLIC`; grants `USAGE, CREATE` to
+  `user_migrate` and `USAGE` only to `user_runtime`.
+- Creates a dedicated `migrate_meta` schema owned by `user_migrate` to hold
+  golang-migrate's `schema_migrations` bookkeeping table, out of `public`.
+  `user_runtime` is granted nothing there, so it can never read or `UPDATE` the
+  version/dirty flags and desync migration state. `cmd/migrate` points the
+  version table at this schema via the driver's `x-migrations-table` option
+  (schema-qualified and quoted); see `internal/user/migrations`.
+- `ALTER DEFAULT PRIVILEGES FOR ROLE user_migrate IN SCHEMA public` so objects
+  created by **future** migrations automatically grant DML (`SELECT/INSERT/
+  UPDATE/DELETE` on tables) and sequence access (`USAGE, SELECT` on sequences)
+  to `user_runtime` — with nothing granted to `PUBLIC`. These default
+  privileges are scoped to `public` only, so the bookkeeping table in
+  `migrate_meta` is never covered.
 
 Because the default privileges are attached to `user_migrate`, a new table in
 a later migration is immediately usable by `user_runtime` without any explicit

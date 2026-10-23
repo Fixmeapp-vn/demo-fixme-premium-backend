@@ -10,13 +10,17 @@ package dbtest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/postgres"
@@ -130,19 +134,39 @@ func setup(t *testing.T) env {
 		}
 	})
 
-	// Apply the same least-privilege model as deployments/postgres, using the
-	// throwaway role names, connected to the new database as superuser.
+	// Apply the privilege model by executing the SAME canonical SQL file the
+	// bootstrap script runs (deployments/postgres/initdb/sql), with the
+	// throwaway role, schema and database names substituted in. Driving the
+	// source of truth means a broken policy file fails these tests instead of
+	// leaving them green against a stale copy.
 	adminDB := e.adminDB(t, e.dbName)
-	exec(ctx, t, adminDB,
-		fmt.Sprintf("REVOKE ALL ON DATABASE %s FROM PUBLIC", e.dbName),
-		fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s, %s", e.dbName, e.migrateRole, e.runtimeRole),
-		"REVOKE ALL ON SCHEMA public FROM PUBLIC",
-		fmt.Sprintf("GRANT USAGE, CREATE ON SCHEMA public TO %s", e.migrateRole),
-		fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s", e.runtimeRole),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %s", e.migrateRole, e.runtimeRole),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO %s", e.migrateRole, e.runtimeRole),
-	)
+	exec(ctx, t, adminDB, e.privilegesSQL(t))
 	return e
+}
+
+// privilegesSQL loads the canonical privilege model and substitutes this
+// environment's throwaway identifiers. The path is resolved relative to this
+// test file via runtime.Caller, so the test executes the real file rather than
+// a copy. The whole file is returned as one string: exec passes it to pgx with
+// no arguments, which runs the statements under the simple query protocol.
+func (e env) privilegesSQL(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed to locate the integration test file")
+	}
+	path := filepath.Join(filepath.Dir(thisFile),
+		"..", "..", "..", "deployments", "postgres", "initdb", "sql", "user-db-privileges.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read canonical privilege SQL %s: %v", path, err)
+	}
+	return strings.NewReplacer(
+		"__db_name__", e.dbName,
+		"__migrate_role__", e.migrateRole,
+		"__runtime_role__", e.runtimeRole,
+		"__migrate_schema__", migrations.MigrationsSchema,
+	).Replace(string(raw))
 }
 
 // adminDB builds a superuser DSN against dbname, preserving the superuser's
@@ -205,6 +229,14 @@ func TestRuntimeRoleHasDMLButNotDDL(t *testing.T) {
 		t.Errorf("users count = %d, want 1", count)
 	}
 
+	// The remaining DML verbs must also be allowed, not only INSERT/SELECT.
+	if _, err := pool.Exec(ctx, "UPDATE users SET email = $1 WHERE id = $2", "b@example.com", id); err != nil {
+		t.Fatalf("runtime UPDATE users: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM users WHERE id = $1", id); err != nil {
+		t.Fatalf("runtime DELETE users: %v", err)
+	}
+
 	// DDL must be denied.
 	if _, err := pool.Exec(ctx, "CREATE TABLE should_fail (id int)"); err == nil {
 		t.Error("runtime CREATE TABLE succeeded; DDL must be denied")
@@ -247,6 +279,49 @@ func TestDefaultPrivilegesCoverSecondMigration(t *testing.T) {
 	}
 }
 
+// TestRuntimeRoleCannotTouchMigrateVersionTable proves the bookkeeping-table
+// isolation: the migrate version table lives in migrations.MigrationsSchema,
+// which user_runtime has no USAGE on, so it can neither read nor UPDATE/DELETE
+// the version/dirty flags and desync migration state. DML on a business table
+// in public must still work.
+func TestRuntimeRoleCannotTouchMigrateVersionTable(t *testing.T) {
+	e := setup(t)
+	if err := migrations.Up(e.migrateDSN(t)); err != nil {
+		t.Fatalf("Up() error = %v", err)
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, e.runtimeDSN(t))
+	if err != nil {
+		t.Fatalf("connect runtime: %v", err)
+	}
+	defer pool.Close()
+
+	versionTable := fmt.Sprintf("%s.%s", migrations.MigrationsSchema, migrations.MigrationsTable)
+	for _, q := range []string{
+		"SELECT version, dirty FROM " + versionTable,
+		"UPDATE " + versionTable + " SET dirty = true",
+		"UPDATE " + versionTable + " SET version = 0",
+		"DELETE FROM " + versionTable,
+		"INSERT INTO " + versionTable + " (version, dirty) VALUES (999, false)",
+	} {
+		_, err := pool.Exec(ctx, q)
+		if err == nil {
+			t.Errorf("runtime %q succeeded; it must be denied on the migrate bookkeeping table", q)
+			continue
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Errorf("runtime %q error = %v, want SQLSTATE 42501 (permission denied)", q, err)
+		}
+	}
+
+	// Sanity: DML on a business table in public is unaffected.
+	if _, err := pool.Exec(ctx, "INSERT INTO users (email) VALUES ($1)", "ok@example.com"); err != nil {
+		t.Fatalf("runtime INSERT into business table users: %v", err)
+	}
+}
+
 func TestRoleWithoutConnectIsRefused(t *testing.T) {
 	e := setup(t)
 	if err := migrations.Up(e.migrateDSN(t)); err != nil {
@@ -256,18 +331,24 @@ func TestRoleWithoutConnectIsRefused(t *testing.T) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, e.noConnDSN(t))
 	if err != nil {
-		// A lazy pool may still parse fine; the failure should come on use.
-		return
+		// The pool is lazy, so construction must succeed; CONNECT is denied
+		// only on first use. A construction error would hide that.
+		t.Fatalf("pgxpool.New for no-connect role: %v", err)
 	}
 	defer pool.Close()
 
-	if err := pool.Ping(ctx); err == nil {
-		t.Error("role without CONNECT reached the database; it must be refused")
-	} else if !strings.Contains(strings.ToLower(err.Error()), "permission") &&
-		!strings.Contains(strings.ToLower(err.Error()), "denied") &&
-		!strings.Contains(strings.ToLower(err.Error()), "not permitted") {
-		// Any connection error is acceptable, but log for diagnostics.
-		t.Logf("no-connect role refused with: %v", err)
+	// The refusal must be a real PostgreSQL permission denial on use, not a
+	// parse failure or a bad-DSN error that merely looks like a pass.
+	err = pool.Ping(ctx)
+	if err == nil {
+		t.Fatal("role without CONNECT reached the database; it must be refused")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("no-connect refusal = %v (%T), want a *pgconn.PgError permission denial", err, err)
+	}
+	if pgErr.Code != "42501" {
+		t.Errorf("no-connect SQLSTATE = %s (%s), want 42501 (permission denied)", pgErr.Code, pgErr.Message)
 	}
 }
 

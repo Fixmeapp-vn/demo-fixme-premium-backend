@@ -12,6 +12,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -25,6 +26,18 @@ import (
 //go:embed *.sql
 var FS embed.FS
 
+const (
+	// MigrationsSchema is the dedicated schema that holds golang-migrate's
+	// bookkeeping (version/dirty) table. Keeping it out of `public` means the
+	// user_runtime role — which is granted nothing in this schema — can never
+	// read or UPDATE the migration version and desync the schema state. The
+	// schema is provisioned once at bootstrap, owned by user_migrate (see
+	// deployments/postgres).
+	MigrationsSchema = "migrate_meta"
+	// MigrationsTable is the bookkeeping table name inside MigrationsSchema.
+	MigrationsTable = "schema_migrations"
+)
+
 // New builds a forward-only migrator for dsn using the embedded SQL. The
 // caller owns the returned *migrate.Migrate and must Close it. The DSN carries
 // a password and is never logged.
@@ -33,7 +46,7 @@ func New(dsn string) (*migrate.Migrate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("migrations: open embedded source: %w", err)
 	}
-	m, err := migrate.NewWithSourceInstance("iofs", src, pgxDSN(dsn))
+	m, err := migrate.NewWithSourceInstance("iofs", src, migrateURL(dsn))
 	if err != nil {
 		return nil, fmt.Errorf("migrations: init migrator: %w", err)
 	}
@@ -68,6 +81,30 @@ func Version(dsn string) (version uint, dirty bool, err error) {
 		return 0, false, fmt.Errorf("migrations: version: %w", err)
 	}
 	return v, d, nil
+}
+
+// migrateURL rewrites dsn to the pgx5:// scheme (see pgxDSN) and pins
+// golang-migrate's bookkeeping table to MigrationsSchema. The pgx/v5 driver
+// (v4.18.1) has no x-migrations-schema option; the supported way to place the
+// version table outside the current schema is a quoted, schema-qualified
+// x-migrations-table (see database/pgx/v5/pgx.go: Open parses
+// x-migrations-table-quoted and ensureVersionTable issues
+// CREATE TABLE "<schema>"."<table>"). Business DDL in the migration files stays
+// unqualified; search_path is pinned to public so those objects are created in
+// public while only the version table lives in MigrationsSchema.
+func migrateURL(dsn string) string {
+	pgx := pgxDSN(dsn)
+	u, err := url.Parse(pgx)
+	if err != nil {
+		// Leave the DSN untouched; migrate surfaces the parse error on use.
+		return pgx
+	}
+	q := u.Query()
+	q.Set("x-migrations-table", fmt.Sprintf("%q.%q", MigrationsSchema, MigrationsTable))
+	q.Set("x-migrations-table-quoted", "true")
+	q.Set("search_path", "public")
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // pgxDSN rewrites a postgres:// or postgresql:// URL to the pgx5:// scheme the

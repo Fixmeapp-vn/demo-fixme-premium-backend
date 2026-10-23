@@ -5,12 +5,17 @@
 # /docker-entrypoint-initdb.d/; it runs once, as the superuser, against a fresh
 # data directory.
 #
-# This script is the single source of truth for the least-privilege model:
+# The roles it provisions:
 #
 #   user_migrate  LOGIN, owns user_db and every object in it, has DDL.
 #                 Used ONLY by cmd/migrate.
 #   user_runtime  LOGIN, DML only (no CREATE/ALTER/DROP, no ownership).
 #                 Used by the api and worker binaries.
+#
+# The in-database privilege model is NOT hardcoded here: it lives in the
+# canonical sql/user-db-privileges.sql, which the integration test also
+# executes, so the two cannot drift. This script creates the roles and database
+# and then applies that file.
 #
 # Role passwords come from the environment; no secrets are hardcoded. The full
 # Docker Compose / hot-reload dev suite is FMT-18 and out of scope here.
@@ -21,6 +26,11 @@ set -euo pipefail
 
 DB_NAME="user_db"
 SUPER_DB="${POSTGRES_DB:-postgres}"
+# Schema that isolates golang-migrate's bookkeeping table from user_runtime.
+# Must match migrations.MigrationsSchema in internal/user/migrations.
+MIGRATE_SCHEMA="migrate_meta"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PRIVILEGES_SQL="${SCRIPT_DIR}/sql/user-db-privileges.sql"
 
 psql_super() {
 	psql -v ON_ERROR_STOP=1 --no-psqlrc --username "$POSTGRES_USER" "$@"
@@ -50,24 +60,15 @@ if [ "$(psql_super --dbname "$SUPER_DB" -tAc "SELECT 1 FROM pg_database WHERE da
 	psql_super --dbname "$SUPER_DB" -c "CREATE DATABASE ${DB_NAME} OWNER user_migrate"
 fi
 
-# Apply the privilege model inside user_db.
-psql_super --dbname "$DB_NAME" <<-EOSQL
-	-- Database: only the two named roles may connect.
-	REVOKE ALL ON DATABASE ${DB_NAME} FROM PUBLIC;
-	GRANT CONNECT ON DATABASE ${DB_NAME} TO user_migrate, user_runtime;
-
-	-- Public schema: no implicit PUBLIC privileges. user_migrate may create
-	-- objects (DDL); user_runtime may only use what already exists.
-	REVOKE ALL ON SCHEMA public FROM PUBLIC;
-	GRANT USAGE, CREATE ON SCHEMA public TO user_migrate;
-	GRANT USAGE ON SCHEMA public TO user_runtime;
-
-	-- Objects created by FUTURE migrations (run as user_migrate) automatically
-	-- grant DML and sequence access to user_runtime, with nothing to PUBLIC.
-	ALTER DEFAULT PRIVILEGES FOR ROLE user_migrate IN SCHEMA public
-	  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO user_runtime;
-	ALTER DEFAULT PRIVILEGES FOR ROLE user_migrate IN SCHEMA public
-	  GRANT USAGE, SELECT ON SEQUENCES TO user_runtime;
-EOSQL
+# Apply the privilege model inside user_db from the canonical SQL file (the
+# single source of truth the integration test also runs). Placeholders are
+# substituted with the concrete database, role and schema names; the result is
+# piped to psql, which stops on the first error (ON_ERROR_STOP via psql_super).
+sed \
+	-e "s/__db_name__/${DB_NAME}/g" \
+	-e "s/__migrate_role__/user_migrate/g" \
+	-e "s/__runtime_role__/user_runtime/g" \
+	-e "s/__migrate_schema__/${MIGRATE_SCHEMA}/g" \
+	"$PRIVILEGES_SQL" | psql_super --dbname "$DB_NAME" -f -
 
 echo "user_db bootstrap complete"

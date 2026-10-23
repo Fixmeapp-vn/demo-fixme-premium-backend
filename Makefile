@@ -7,6 +7,12 @@ include .env
 export
 endif
 
+# FMT-8: the migrate credential must reach cmd/migrate only. Drop it from the
+# blanket export (and from any value inherited from the shell) so run-api and
+# run-worker never carry it in their process environment; the migrate target
+# re-exports it for itself below.
+unexport USER_MIGRATE_DATABASE_URL
+
 .PHONY: help run-api run-worker migrate build test test-integration test-race fmt vet clean
 
 help: ## List available targets
@@ -18,6 +24,7 @@ run-api: ## Run the API locally
 run-worker: ## Run the background worker locally
 	$(GO) run ./cmd/worker
 
+migrate: export USER_MIGRATE_DATABASE_URL := $(USER_MIGRATE_DATABASE_URL)
 migrate: ## Apply User module DB migrations (needs USER_MIGRATE_DATABASE_URL)
 	$(GO) run ./cmd/migrate up
 
