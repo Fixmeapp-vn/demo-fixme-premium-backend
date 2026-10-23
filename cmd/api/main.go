@@ -16,6 +16,7 @@ import (
 	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/httpx"
 	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/logging"
 	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/observability"
+	"github.com/fixmeapp-vn/demo-fixme-premium-backend/internal/platform/postgres"
 )
 
 const serviceName = "api"
@@ -44,6 +45,23 @@ func run(ctx context.Context, lookup config.LookupFunc, stdout, stderr io.Writer
 
 	metrics := observability.NewMetrics()
 
+	// The runtime (user_runtime) pool is optional: when no database is
+	// configured the API starts without a readiness check. Migrations are
+	// never applied here; that is cmd/migrate's job as user_migrate. The
+	// pool is lazy, so the API still starts while Postgres is down and
+	// readiness flips to healthy once it is reachable.
+	var readinessChecks []httpx.HealthCheck
+	if cfg.UserDatabaseURL != "" {
+		pool, err := postgres.Open(ctx, cfg.UserDatabaseURL)
+		if err != nil {
+			logger.Error("failed to open user database pool", slog.Any("error", err))
+			return 1
+		}
+		defer pool.Close()
+		readinessChecks = append(readinessChecks, postgres.NewCheck("user_db", pool, 0))
+		logger.Info("user database configured")
+	}
+
 	api := httpx.NewServer(httpx.ServerConfig{
 		Name:              "api",
 		Addr:              cfg.HTTP.Addr,
@@ -52,7 +70,7 @@ func run(ctx context.Context, lookup config.LookupFunc, stdout, stderr io.Writer
 		WriteTimeout:      cfg.HTTP.WriteTimeout,
 		IdleTimeout:       cfg.HTTP.IdleTimeout,
 		ShutdownTimeout:   cfg.ShutdownTimeout,
-	}, httpx.NewRouter(httpx.RouterDeps{Logger: logger, Observer: metrics}), logger)
+	}, httpx.NewRouter(httpx.RouterDeps{Logger: logger, Observer: metrics, ReadinessChecks: readinessChecks}), logger)
 
 	internal := httpx.NewServer(httpx.ServerConfig{
 		Name:              "metrics",
