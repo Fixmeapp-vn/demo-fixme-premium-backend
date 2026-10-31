@@ -109,6 +109,54 @@ func TestRunInvalidConfigExitsNonZero(t *testing.T) {
 	}
 }
 
+func TestRunRequiresUserDatabaseURLInStagingAndProduction(t *testing.T) {
+	for _, appEnv := range []string{"staging", "production"} {
+		t.Run(appEnv, func(t *testing.T) {
+			var stderr bytes.Buffer
+			code := run(context.Background(), env(map[string]string{
+				"APP_ENV": appEnv, "HTTP_ADDR": freeAddr(t), "METRICS_ADDR": freeAddr(t),
+			}), io.Discard, &stderr)
+			if code != 1 {
+				t.Errorf("exit code = %d, want 1 when USER_DATABASE_URL is unset in %s", code, appEnv)
+			}
+			if !strings.Contains(stderr.String(), "USER_DATABASE_URL") {
+				t.Errorf("stderr = %q, want it to name USER_DATABASE_URL", stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunStartsWithoutDatabaseInDevelopmentAndTest(t *testing.T) {
+	for _, appEnv := range []string{"development", "test"} {
+		t.Run(appEnv, func(t *testing.T) {
+			apiAddr, metricsAddr := freeAddr(t), freeAddr(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			var out syncBuffer
+			code := make(chan int, 1)
+			go func() {
+				code <- run(ctx, env(map[string]string{
+					"APP_ENV": appEnv, "HTTP_ADDR": apiAddr, "METRICS_ADDR": metricsAddr, "SHUTDOWN_TIMEOUT": "2s",
+				}), &out, &out)
+			}()
+
+			// With no USER_DATABASE_URL the API must still start and serve.
+			if status, body := get(t, "http://"+apiAddr+"/health/ready"); status != 200 {
+				t.Errorf("readiness = %d %s, want 200 with no database configured", status, body)
+			}
+
+			cancel()
+			select {
+			case c := <-code:
+				if c != 0 {
+					t.Errorf("exit code = %d, want 0", c)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("run did not return after cancellation")
+			}
+		})
+	}
+}
+
 func TestRunStartupFailureExitsNonZero(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

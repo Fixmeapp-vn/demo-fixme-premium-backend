@@ -75,6 +75,37 @@ func TestLoadValidValues(t *testing.T) {
 	}
 }
 
+func TestLoadUserDatabaseURL(t *testing.T) {
+	const url = "postgres://user_runtime:pw@localhost:5432/user_db?sslmode=disable"
+	cfg, err := config.Load(lookupFrom(map[string]string{"USER_DATABASE_URL": "  " + url + "  "}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.UserDatabaseURL != url {
+		t.Errorf("UserDatabaseURL = %q, want %q", cfg.UserDatabaseURL, url)
+	}
+}
+
+func TestLoadUserDatabaseURLOptional(t *testing.T) {
+	cfg, err := config.Load(lookupFrom(nil))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.UserDatabaseURL != "" {
+		t.Errorf("UserDatabaseURL = %q, want empty when unset", cfg.UserDatabaseURL)
+	}
+}
+
+func TestLoadUserDatabaseURLInvalidScheme(t *testing.T) {
+	_, err := config.Load(lookupFrom(map[string]string{"USER_DATABASE_URL": "mysql://user_runtime:pw@localhost/user_db"}))
+	if err == nil {
+		t.Fatal("Load() error = nil, want error for non-postgres scheme")
+	}
+	if !strings.Contains(err.Error(), "USER_DATABASE_URL:") {
+		t.Errorf("error %q does not mention USER_DATABASE_URL", err)
+	}
+}
+
 func TestLoadAcceptsEveryAppEnv(t *testing.T) {
 	for _, env := range []string{"development", "test", "staging", "production"} {
 		t.Run(env, func(t *testing.T) {
@@ -151,5 +182,21 @@ func TestConfigLogValue(t *testing.T) {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("log output %s does not contain %s", buf.String(), want)
 		}
+	}
+}
+
+func TestConfigLogValueNeverLogsDatabaseURL(t *testing.T) {
+	const secret = "s3cr3t-password"
+	cfg, err := config.Load(lookupFrom(map[string]string{
+		"USER_DATABASE_URL": "postgres://user_runtime:" + secret + "@localhost:5432/user_db",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", slog.Any("config", cfg))
+
+	if strings.Contains(buf.String(), secret) || strings.Contains(buf.String(), "user_db") {
+		t.Errorf("log output leaks the database URL: %s", buf.String())
 	}
 }
