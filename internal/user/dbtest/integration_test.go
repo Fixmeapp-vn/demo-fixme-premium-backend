@@ -197,8 +197,8 @@ func TestForwardOnlyBringUpReachesHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Version() error = %v", err)
 	}
-	if version != 2 || dirty {
-		t.Errorf("version = %d dirty = %t, want 2 false", version, dirty)
+	if version != 1 || dirty {
+		t.Errorf("version = %d dirty = %t, want 1 false", version, dirty)
 	}
 }
 
@@ -246,6 +246,11 @@ func TestRuntimeRoleHasDMLButNotDDL(t *testing.T) {
 	}
 }
 
+// TestDefaultPrivilegesCoverSecondMigration proves that objects created by
+// the migrate role AFTER bootstrap (i.e. by any future migration) are usable by
+// user_runtime purely through ALTER DEFAULT PRIVILEGES. The table is created
+// here by the test, as the migrate role, rather than shipped as an embedded
+// forward-only migration, so no placeholder schema is committed to user_db.
 func TestDefaultPrivilegesCoverSecondMigration(t *testing.T) {
 	e := setup(t)
 	if err := migrations.Up(e.migrateDSN(t)); err != nil {
@@ -253,29 +258,33 @@ func TestDefaultPrivilegesCoverSecondMigration(t *testing.T) {
 	}
 
 	ctx := context.Background()
+
+	// Simulate a later migration: the migrate role creates a new table with a
+	// bigserial (sequence-backed) column. No explicit GRANT is issued.
+	exec(ctx, t, e.migrateDSN(t),
+		"CREATE TABLE it_future_table (id bigserial PRIMARY KEY, note text NOT NULL)")
+
 	pool, err := pgxpool.New(ctx, e.runtimeDSN(t))
 	if err != nil {
 		t.Fatalf("connect runtime: %v", err)
 	}
 	defer pool.Close()
 
-	var userID int64
+	// The INSERT (and its nextval on the sequence) must succeed purely from
+	// the default privileges attached to the migrate role at bootstrap.
+	var id int64
 	if err := pool.QueryRow(ctx,
-		"INSERT INTO users (email) VALUES ($1) RETURNING id", "owner@example.com").Scan(&userID); err != nil {
-		t.Fatalf("seed users row: %v", err)
+		"INSERT INTO it_future_table (note) VALUES ($1) RETURNING id", "example").Scan(&id); err != nil {
+		t.Fatalf("runtime INSERT into migrate-created table via default privileges: %v", err)
 	}
-
-	// user_profiles is from the SECOND migration and uses a bigserial
-	// sequence. No explicit grant exists for it; the INSERT (and its nextval)
-	// must succeed purely from ALTER DEFAULT PRIVILEGES.
-	var profileID int64
-	if err := pool.QueryRow(ctx,
-		"INSERT INTO user_profiles (user_id, display_name) VALUES ($1, $2) RETURNING id",
-		userID, "Example").Scan(&profileID); err != nil {
-		t.Fatalf("runtime INSERT into user_profiles via default privileges: %v", err)
+	if id <= 0 {
+		t.Errorf("id = %d, want a sequence-generated positive value", id)
 	}
-	if profileID <= 0 {
-		t.Errorf("profile id = %d, want a sequence-generated positive value", profileID)
+	if _, err := pool.Exec(ctx, "UPDATE it_future_table SET note = $1 WHERE id = $2", "changed", id); err != nil {
+		t.Fatalf("runtime UPDATE via default privileges: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM it_future_table WHERE id = $1", id); err != nil {
+		t.Fatalf("runtime DELETE via default privileges: %v", err)
 	}
 }
 

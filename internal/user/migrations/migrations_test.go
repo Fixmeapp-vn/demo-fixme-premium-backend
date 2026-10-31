@@ -46,7 +46,7 @@ func TestEmbeddedMigrationsAreForwardOnlyAndContiguous(t *testing.T) {
 		version = next
 	}
 
-	want := []uint{1, 2}
+	want := []uint{1}
 	if len(versions) != len(want) {
 		t.Fatalf("versions = %v, want %v", versions, want)
 	}
